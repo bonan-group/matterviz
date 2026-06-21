@@ -6,7 +6,7 @@ import {
   STRUCT_KEYWORDS_STRICT_REGEX,
   STRUCTURE_EXTENSIONS_REGEX,
   TRAJ_KEYWORDS_REGEX,
-  VASP_FILES_REGEX,
+  STRUCTURE_FILES_REGEX,
   XYZ_EXTXYZ_REGEX,
 } from '$lib/constants'
 import type { ElementSymbol } from '$lib/element'
@@ -1930,7 +1930,7 @@ export function is_structure_file(filename: string): boolean {
 
   // Always structure formats
   if (STRUCTURE_EXTENSIONS_REGEX.test(name)) return true
-  if (VASP_FILES_REGEX.test(name)) return true
+  if (STRUCTURE_FILES_REGEX.test(name)) return true
 
   // .xyz/.extxyz files: structure unless they have trajectory keywords
   if (/\.(?:xyz|extxyz)$/i.test(name)) return !TRAJ_KEYWORDS_REGEX.test(name)
