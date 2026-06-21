@@ -3,6 +3,10 @@ import { mat3x3_vec3_multiply, transpose_3x3_matrix } from '$lib/math'
 import type { ParsedStructure } from '$lib/structure/parse'
 import {
   detect_structure_type,
+  parse_abacus_stru,
+  parse_castep_cell,
+  parse_castep_geom,
+  parse_shelx,
   is_optimade_json,
   is_structure_file,
   optimade_to_crystal,
@@ -3590,5 +3594,261 @@ describe(`Coordinate Normalization`, () => {
     expect(result?.sites[0].abc).toEqual([0, 0, 0])
     expect(result?.sites[1].abc[2]).toBeCloseTo(0.5, 10)
     expect(result?.sites[2].abc).toEqual([0.5, 0.5, 0.75])
+  })
+})
+
+
+describe(`additional geometry format parsers`, () => {
+  it(`parses CASTEP .cell geometry blocks`, () => {
+    const content = `%BLOCK LATTICE_CART
+ang
+3.0 0.0 0.0
+0.0 3.0 0.0
+0.0 0.0 3.0
+%ENDBLOCK LATTICE_CART
+
+%BLOCK POSITIONS_FRAC
+Si 0.0 0.0 0.0
+Si 0.25 0.25 0.25
+%ENDBLOCK POSITIONS_FRAC
+`
+    const parsed = parse_castep_cell(content)
+    expect(parsed?.sites).toHaveLength(2)
+    expect(parsed?.lattice?.a).toBeCloseTo(3)
+    expect(parsed?.sites[1].abc).toEqual([0.25, 0.25, 0.25])
+    expect(parse_structure_file(content, `Si.cell`).sites).toHaveLength(2)
+    expect(detect_structure_type(`Si.cell`, content)).toBe(`crystal`)
+  })
+
+  it(`parses CASTEP cell parameters with Cartesian positions`, () => {
+    const content = `%BLOCK LATTICE_ABC
+4.0 5.0 6.0
+90 90 90
+%ENDBLOCK LATTICE_ABC
+
+%BLOCK POSITIONS_ABS
+Si 1.0 1.25 1.5
+%ENDBLOCK POSITIONS_ABS
+`
+    const parsed = parse_castep_cell(content)
+    expect(parsed?.sites).toHaveLength(1)
+    expect(parsed?.lattice?.a).toBeCloseTo(4)
+    expect(parsed?.lattice?.b).toBeCloseTo(5)
+    expect(parsed?.lattice?.c).toBeCloseTo(6)
+    expect(parsed?.sites[0].abc).toEqual([0.25, 0.25, 0.25])
+  })
+
+  it(`parses CASTEP .geom cell and position records`, () => {
+    const content = ` BEGIN header
+
+ END header
+
+                      0                                  F   F   F   F            <-- c
+                    -1.0000000000000000E+000  -1.0000000000000000E+000                             <-- E
+                      5.6691783729612542E+000   0.0000000000000000E+000   0.0000000000000000E+000  <-- h
+                      0.0000000000000000E+000   5.6691783729612542E+000   0.0000000000000000E+000  <-- h
+                      0.0000000000000000E+000   0.0000000000000000E+000   5.6691783729612542E+000  <-- h
+Si 1                  0.0000000000000000E+000   0.0000000000000000E+000   0.0000000000000000E+000  <-- R
+Si 2                  1.4172945932403135E+000   1.4172945932403135E+000   1.4172945932403135E+000  <-- R
+`
+    const parsed = parse_castep_geom(content)
+    expect(parsed?.sites).toHaveLength(2)
+    expect(parsed?.lattice?.a).toBeCloseTo(3)
+    expect(parsed?.sites[1].abc).toEqual([0.25, 0.25, 0.25])
+    expect(parse_structure_file(content, `Si.geom`).sites).toHaveLength(2)
+    expect(detect_structure_type(`Si.geom`, content)).toBe(`crystal`)
+  })
+
+  it(`parses representative CASTEP .cell output with ANG units`, () => {
+    const content = `# CELL file written 18:52:52 (GMT+8.0) 10th September 2023 from run Si
+
+%BLOCK lattice_cart
+   ANG
+      0.595654372411307E-02    2.71880431126064        2.71880434861257
+       2.71880453174374       0.595648790958725E-02    2.71880440452213
+       2.71880453310134        2.71880436852779       0.595648655186971E-02
+%ENDBLOCK lattice_cart
+
+%BLOCK positions_frac
+   Si             0.000065304037343       0.000065292078835       0.000065290775087
+   Si             0.249934695962657       0.249934707921165       0.249934709224913
+%ENDBLOCK positions_frac
+
+FIX_COM : true
+`
+    const parsed = parse_structure_file(content, `Si.cell`)
+    expect(parsed.sites).toHaveLength(2)
+    expect(parsed.lattice?.a).toBeCloseTo(3.8449745707061838)
+    expect(parsed.sites[1].abc[0]).toBeCloseTo(0.249934695962657)
+  })
+
+  it(`parses representative multi-frame CASTEP .geom output`, () => {
+    const content = ` BEGIN header
+
+ END header
+
+                                      0                                     F   F   F   F            <-- c
+                     -1.2529836748845065E+001   -1.2529836748845065E+001                             <-- E
+                      5.8456527777162943E+000    2.1335571759495822E+000    3.6954411884936356E+000  <-- h
+                      0.0000000000000000E+000    6.4006817113512176E+000    3.5064626964620480E+000  <-- h
+                      0.0000000000000000E+000    0.0000000000000000E+000    7.3908706180914798E+000  <-- h
+ Si              1    0.0000000000000000E+000    0.0000000000000000E+000    0.0000000000000000E+000  <-- R
+ Si              2    1.4614131944290736E+000    2.1335597218251996E+000    3.6481936257617908E+000  <-- R
+ Si              1    6.5473162495460237E-003   -7.2639719879122430E-004   -3.3889362907795111E-003  <-- F
+ Si              2   -6.5473162495460237E-003    7.2639719879122430E-004    3.3889362907795111E-003  <-- F
+
+                                      2                                     T   T   T   T            <-- c
+                     -1.2530046864616429E+001   -1.2530046864616429E+001                             <-- E
+                      5.8456527777162943E+000    2.1335571759495835E+000    3.6954411884936356E+000  <-- h
+                      0.0000000000000000E+000    6.4006817113512176E+000    3.5064626964620480E+000  <-- h
+                      0.0000000000000000E+000    0.0000000000000000E+000    7.3908706180914798E+000  <-- h
+ Si              1    2.5363275313771038E-002   -2.8292097139775872E-003   -1.3322823607942378E-002  <-- R
+ Si              2    1.4360499191153027E+000    2.1363889315391775E+000    3.6615164493697336E+000  <-- R
+ Si              1   -2.4888208077965789E-004   -1.5222728577187475E-005   -3.9883663392703680E-004  <-- F
+ Si              2    2.4888208077965789E-004    1.5222728577187475E-005    3.9883663392703680E-004  <-- F
+`
+    const parsed = parse_structure_file(content, `Si.geom`)
+    expect(parsed.sites).toHaveLength(2)
+    expect(parsed.lattice?.a).toBeCloseTo(3.829868952833782)
+    expect(parsed.sites[0].xyz[0]).toBeCloseTo(0.013421)
+  })
+
+  it(`parses SHELX/AIRSS .res fractional geometry`, () => {
+    const content = `TITL Si
+CELL 1.0 5.43 5.43 5.43 90 90 90
+LATT -1
+SFAC Si
+Si1 1 0.0 0.0 0.0 1.0
+Si2 1 0.25 0.25 0.25 1.0
+END
+`
+    const parsed = parse_shelx(content)
+    expect(parsed?.sites).toHaveLength(2)
+    expect(parsed?.sites[0].species[0].element).toBe(`Si`)
+    expect(parsed?.sites[1].xyz[0]).toBeCloseTo(1.3575)
+    expect(parse_structure_file(content, `Si.res`).sites).toHaveLength(2)
+    expect(detect_structure_type(`Si.res`, content)).toBe(`crystal`)
+  })
+
+  it(`parses representative SHELX/AIRSS .res output`, () => {
+    const content = `TITL B-SAMPLING-26-05-11-22-35-24-16364035 0.0049432272 88.8196348609 -988.5440686940 0.000 0.000 12 (P1) n - 1
+REM Composition: B 12.0
+CELL 1.54180 2.900185 4.583735 6.690370 92.860978 90.684126 90.420836
+LATT -1
+SFAC B
+B        1  0.259326432788  0.668326616272  0.077950905879 1.0
+B        1  0.753047452417  0.760541489189  0.719718361629 1.0
+B        1  0.261019409812  0.329577989511  0.219436555043 1.0
+B        1  0.259711264665  0.988574490272  0.294069207671 1.0
+B        1  0.256252143644  0.911693082446  0.820093670106 1.0
+B        1  0.258381181578  0.660051313524  0.351052302273 1.0
+B        1  0.758426035053  0.822036988143  0.975065102783 1.0
+B        1  0.756713578077  0.140218705622  0.135906017882 1.0
+B        1  0.249876600782  0.608349827199  0.610724948964 1.0
+B        1  0.750223106048  0.398100970599  0.647090555185 1.0
+B        1  0.251316079675  0.263088012517  0.724617822388 1.0
+B        1  0.253667815461  0.278257014707  0.971536750196 1.0
+END
+`
+    const parsed = parse_structure_file(content, `B.res`)
+    expect(parsed.sites).toHaveLength(12)
+    expect(parsed.lattice?.a).toBeCloseTo(2.900185)
+    expect(parsed.sites[0].species[0].element).toBe(`B`)
+  })
+
+  it(`parses ABACUS STRU Direct geometry`, () => {
+    const content = `ATOMIC_SPECIES
+Si 28.0855 Si.upf
+
+LATTICE_CONSTANT
+2.0
+
+LATTICE_VECTORS
+1.5 0.0 0.0
+0.0 1.5 0.0
+0.0 0.0 1.5
+
+ATOMIC_POSITIONS
+Direct
+Si
+0.0
+2
+0.0 0.0 0.0 0 0 0
+0.25 0.25 0.25 1 1 1
+`
+    const parsed = parse_abacus_stru(content)
+    expect(parsed?.sites).toHaveLength(2)
+    expect(parsed?.lattice?.a).toBeCloseTo(3)
+    expect(parsed?.sites[1].xyz).toEqual([0.75, 0.75, 0.75])
+    expect(parse_structure_file(content, `STRU`).sites).toHaveLength(2)
+    expect(detect_structure_type(`STRU`, content)).toBe(`crystal`)
+  })
+
+  it(`parses representative ABACUS STRU output with blank-separated species`, () => {
+    const content = `ATOMIC_SPECIES
+Ga      1       Ga.upf
+As      1       As_ONCV_PBE-1.0.upf
+
+NUMERICAL_ORBITAL
+Ga_gga_8au_100Ry_2s2p2d1f.orb
+As_gga_7au_100Ry_2s2p1d.orb
+
+LATTICE_CONSTANT
+1.889766
+
+LATTICE_VECTORS
+0.0     2.825179        2.825179
+2.825179        0.0     2.825179
+2.825179        2.825179        0.0
+
+ATOMIC_POSITIONS
+Direct
+
+Ga
+0.0
+1
+0.0     0.0     0.0     1 1 1
+
+As
+0.0
+1
+0.25    0.25    0.25    1 1 1
+`
+    const parsed = parse_structure_file(content, `STRU`)
+    expect(parsed.sites).toHaveLength(2)
+    expect(parsed.sites[0].species[0].element).toBe(`Ga`)
+    expect(parsed.sites[1].species[0].element).toBe(`As`)
+    expect(parsed.lattice?.a).toBeCloseTo(7.550383280379679)
+    expect(parsed.sites[1].abc).toEqual([0.25, 0.25, 0.25])
+  })
+
+  it(`parses ABACUS STRU lattice parameters with Cartesian coordinates`, () => {
+    const content = `LATTICE_CONSTANT
+2.0
+
+LATTICE_PARAMETERS
+2.0 3.0 4.0 90 90 90
+
+ATOMIC_POSITIONS
+Cartesian
+Si
+0.0
+1
+1.0 1.5 2.0
+`
+    const parsed = parse_abacus_stru(content)
+    expect(parsed?.sites).toHaveLength(1)
+    expect(parsed?.lattice?.a).toBeCloseTo(4)
+    expect(parsed?.lattice?.b).toBeCloseTo(6)
+    expect(parsed?.lattice?.c).toBeCloseTo(8)
+    expect(parsed?.sites[0].abc).toEqual([0.5, 0.5, 0.5])
+    expect(parse_structure_file(content, `STRU`).sites).toHaveLength(1)
+  })
+
+  it(`recognizes new structure filename extensions`, () => {
+    expect(is_structure_file(`example.cell`)).toBe(true)
+    expect(is_structure_file(`example.geom`)).toBe(true)
+    expect(is_structure_file(`example.res`)).toBe(true)
+    expect(is_structure_file(`STRU`)).toBe(true)
   })
 })

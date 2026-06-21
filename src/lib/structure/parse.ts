@@ -6,7 +6,7 @@ import {
   STRUCT_KEYWORDS_STRICT_REGEX,
   STRUCTURE_EXTENSIONS_REGEX,
   TRAJ_KEYWORDS_REGEX,
-  VASP_FILES_REGEX,
+  STRUCTURE_FILES_REGEX,
   XYZ_EXTXYZ_REGEX,
 } from '$lib/constants'
 import type { ElementSymbol } from '$lib/element'
@@ -263,6 +263,226 @@ const cart_to_frac_with_fallback = (
     Math.hypot(...matrix[2]),
   ]
   return { convert: (xyz: Vec3) => approximate_cart_to_frac(xyz, lengths), exact: false }
+}
+
+
+const strip_inline_comment = (line: string): string => line.replace(/[#!].*$/, ``).trim()
+const number_tokens = (line: string): number[] =>
+  strip_inline_comment(line).split(/\s+/).map(Number).filter(Number.isFinite)
+const lattice_from_matrix = (matrix: math.Matrix3x3): NonNullable<ParsedStructure[`lattice`]> => ({
+  matrix,
+  ...math.calc_lattice_params(matrix),
+  pbc: [true, true, true],
+})
+
+const build_periodic_sites = (
+  atoms: { element: string; coords: Vec3; mode: `frac` | `cart`; label?: string }[],
+  lattice_matrix: math.Matrix3x3,
+  context: string,
+): ParsedStructure => {
+  const lattice = lattice_from_matrix(lattice_matrix)
+  const frac_to_cart = math.create_frac_to_cart(lattice_matrix)
+  const cart_to_frac = cart_to_frac_with_fallback(lattice_matrix, [lattice.a, lattice.b, lattice.c])
+  if (!cart_to_frac.exact) diag_warn(`${context}: singular lattice, using axis-length fallback for cart→frac`)
+  const sites = atoms.map((atom, idx) => {
+    const element = validate_element_symbol(atom.element, idx)
+    const abc = wrap_to_unit_cell(atom.mode === `frac` ? atom.coords : cart_to_frac.convert(atom.coords))
+    const xyz = frac_to_cart(abc)
+    return make_site(element, abc, xyz, atom.label ?? `${element}${idx + 1}`)
+  })
+  return { sites, lattice }
+}
+
+const find_block = (lines: string[], name: string): string[] | null => {
+  const start_re = new RegExp(`^%?block\\s+${name}$`, `i`)
+  const end_re = new RegExp(`^%?endblock\\s+${name}$`, `i`)
+  const start = lines.findIndex((line) => start_re.test(strip_inline_comment(line)))
+  if (start < 0) return null
+  const end = lines.findIndex((line, idx) => idx > start && end_re.test(strip_inline_comment(line)))
+  return lines.slice(start + 1, end < 0 ? lines.length : end)
+}
+
+const BOHR_TO_ANGSTROM = 0.5291772108
+const unit_scale_to_angstrom = (line: string | undefined): number =>
+  /^(?:bohr|au|a\.u\.)$/i.test(line?.trim() ?? ``) ? BOHR_TO_ANGSTROM : 1
+
+// Parse CASTEP .geom geometry-only data. CASTEP writes .geom cell vectors and
+// positions in atomic units, tagged by "<-- h" and "<-- R" respectively.
+export function parse_castep_geom(content: string): ParsedStructure | null {
+  try {
+    const frames = content
+      .split(/\r?\n\s*\r?\n/)
+      .map((frame) => frame.split(/\r?\n/).map((line) => line.trim()).filter(Boolean))
+      .filter((frame) => frame.some((line) => line.endsWith(`<-- h`)) && frame.some((line) => line.endsWith(`<-- R`)))
+    const lines = frames.at(-1)
+    if (!lines) {
+      diag_error(`CASTEP .geom file missing cell or position records`)
+      return null
+    }
+    const lattice_matrix = matrix3x3_from_rows(
+      lines
+        .filter((line) => line.endsWith(`<-- h`))
+        .slice(0, 3)
+        .map((line) => line.split(/\s+/).slice(0, 3).map((v) => parse_coordinate(v) * BOHR_TO_ANGSTROM)),
+      `CASTEP .geom lattice vector`,
+    )
+    const atoms = lines.filter((line) => line.endsWith(`<-- R`)).map((line, idx) => {
+      const parts = line.split(/\s+/)
+      return {
+        element: parts[0],
+        coords: vec3_from_values(
+          parts.slice(2, 5).map((v) => parse_coordinate(v) * BOHR_TO_ANGSTROM),
+          `CASTEP .geom atom ${idx + 1}`,
+        ),
+        mode: `cart` as const,
+      }
+    })
+    return atoms.length ? build_periodic_sites(atoms, lattice_matrix, `CASTEP .geom`) : null
+  } catch (error) {
+    diag_error(`Error parsing CASTEP .geom file`, error)
+    return null
+  }
+}
+
+// Parse CASTEP .cell geometry-only data.
+export function parse_castep_cell(content: string): ParsedStructure | null {
+  try {
+    const lines = content.split(/\r?\n/)
+    let lattice_matrix: math.Matrix3x3 | null = null
+    const lattice_cart = find_block(lines, `lattice_cart`)
+    if (lattice_cart) {
+      const vec_lines = lattice_cart.map(strip_inline_comment).filter(Boolean)
+      const offset = vec_lines[0] && !/^[+-]?(?:\d|\.)/.test(vec_lines[0]) ? 1 : 0
+      const scale = unit_scale_to_angstrom(offset ? vec_lines[0] : undefined)
+      lattice_matrix = matrix3x3_from_rows(
+        vec_lines.slice(offset, offset + 3).map((line) => line.split(/\s+/).slice(0, 3).map((v) => parse_coordinate(v) * scale)),
+        `CASTEP lattice vector`,
+      )
+    }
+    const lattice_abc = find_block(lines, `lattice_abc`)
+    if (!lattice_matrix && lattice_abc) {
+      const nums = lattice_abc.flatMap(number_tokens)
+      if (nums.length >= 6) lattice_matrix = math.cell_to_lattice_matrix(nums[0], nums[1], nums[2], nums[3], nums[4], nums[5])
+    }
+    if (!lattice_matrix) {
+      diag_error(`CASTEP file missing LATTICE_CART or LATTICE_ABC block`)
+      return null
+    }
+    const pos_frac = find_block(lines, `positions_frac`)
+    const pos_abs = find_block(lines, `positions_abs`) ?? find_block(lines, `positions_cart`)
+    const pos_block = pos_frac ?? pos_abs
+    if (!pos_block) {
+      diag_error(`CASTEP file missing POSITIONS_FRAC or POSITIONS_ABS block`)
+      return null
+    }
+    const pos_lines = pos_block.map(strip_inline_comment).filter(Boolean)
+    const pos_offset = !pos_frac && pos_lines[0] && !/^[A-Za-z]{1,3}\b\s+[+-]?(?:\d|\.)/.test(pos_lines[0]) ? 1 : 0
+    const pos_scale = !pos_frac ? unit_scale_to_angstrom(pos_offset ? pos_lines[0] : undefined) : 1
+    const atoms = pos_lines.slice(pos_offset).map((line, idx) => {
+      const parts = line.split(/\s+/)
+      return {
+        element: parts[0],
+        coords: vec3_from_values(parts.slice(1, 4).map((v) => parse_coordinate(v) * pos_scale), `CASTEP atom ${idx + 1}`),
+        mode: pos_frac ? `frac` as const : `cart` as const,
+      }
+    })
+    return atoms.length ? build_periodic_sites(atoms, lattice_matrix, `CASTEP`) : null
+  } catch (error) {
+    diag_error(`Error parsing CASTEP file`, error)
+    return null
+  }
+}
+
+// Parse SHELX/AIRSS .res geometry-only data.
+export function parse_shelx(content: string): ParsedStructure | null {
+  try {
+    const lines = content.split(/\r?\n/).map(strip_inline_comment).filter(Boolean)
+    const cell = lines.find((line) => /^cell\b/i.test(line))
+    if (!cell) {
+      diag_error(`SHELX file missing CELL record`)
+      return null
+    }
+    const nums = number_tokens(cell)
+    const params = nums.length >= 7 ? nums.slice(1, 7) : nums.slice(0, 6)
+    if (params.length < 6) return null
+    const lattice_matrix = math.cell_to_lattice_matrix(params[0], params[1], params[2], params[3], params[4], params[5])
+    const ignored = /^(titl|cell|zerr|latt|symm|sfac|unit|fvar|rem|end|eqiv|shel|dfix|htab|bond|conf|acta|list|temp|size|more|omit|plan|fmap|grid|wght)\b/i
+    const atoms = lines.filter((line) => !ignored.test(line)).map((line) => line.split(/\s+/)).filter((p) => p.length >= 4 && !Number.isFinite(Number(p[0]))).map((p, idx) => {
+      const coord_start = Number.isFinite(Number(p[1])) && p.length >= 5 ? 2 : 1
+      const label = p[0]
+      const element = label.replace(/[^A-Za-z].*$/, ``)
+      return { element, label, coords: vec3_from_values(p.slice(coord_start, coord_start + 3).map(parse_coordinate), `SHELX atom ${idx + 1}`), mode: `frac` as const }
+    })
+    return atoms.length ? build_periodic_sites(atoms, lattice_matrix, `SHELX`) : null
+  } catch (error) {
+    diag_error(`Error parsing SHELX file`, error)
+    return null
+  }
+}
+
+// Parse ABACUS STRU geometry-only data.
+export function parse_abacus_stru(content: string): ParsedStructure | null {
+  try {
+    const lines = content.split(/\r?\n/).map(strip_inline_comment)
+    const find = (name: string) => lines.findIndex((line) => line.toUpperCase() === name)
+    const scale_idx = find(`LATTICE_CONSTANT`)
+    const scale = scale_idx >= 0 ? parse_coordinate(lines[scale_idx + 1]) : 1
+    const lv_idx = find(`LATTICE_VECTORS`)
+    const lp_idx = find(`LATTICE_PARAMETERS`)
+    let lattice_matrix: math.Matrix3x3 | null = null
+    if (lv_idx >= 0) {
+      lattice_matrix = matrix3x3_from_rows(
+        lines.slice(lv_idx + 1, lv_idx + 4).map((line) => line.split(/\s+/).slice(0, 3).map((v) => parse_coordinate(v) * scale)),
+        `ABACUS lattice vector`,
+      )
+    } else if (lp_idx >= 0) {
+      const params = number_tokens(lines[lp_idx + 1] ?? ``)
+      if (params.length >= 6) {
+        lattice_matrix = math.cell_to_lattice_matrix(
+          params[0] * scale,
+          params[1] * scale,
+          params[2] * scale,
+          params[3],
+          params[4],
+          params[5],
+        )
+      }
+    }
+    if (!lattice_matrix) {
+      diag_error(`ABACUS STRU file missing LATTICE_VECTORS or LATTICE_PARAMETERS`)
+      return null
+    }
+    const pos_idx = find(`ATOMIC_POSITIONS`)
+    if (pos_idx < 0) {
+      diag_error(`ABACUS STRU file missing ATOMIC_POSITIONS`)
+      return null
+    }
+    const mode_line = lines[pos_idx + 1]?.toLowerCase() ?? `direct`
+    const mode: `frac` | `cart` = mode_line.startsWith(`cart`) ? `cart` : `frac`
+    const cart_scale = mode_line.includes(`angstrom`) ? 1 : scale
+    let idx = pos_idx + 2
+    const atoms: { element: string; coords: Vec3; mode: `frac` | `cart` }[] = []
+    while (idx < lines.length) {
+      while (idx < lines.length && !lines[idx]?.trim()) idx++
+      const element = lines[idx++]?.trim()
+      if (!element || ([`NUMERICAL_ORBITAL`, `NUMERICAL_DESCRIPTOR`, `LATTICE_VECTORS`, `LATTICE_PARAMETERS`].includes(element.toUpperCase()))) break
+      while (idx < lines.length && !lines[idx]?.trim()) idx++
+      idx++
+      while (idx < lines.length && !lines[idx]?.trim()) idx++
+      const count = parseInt(lines[idx++] ?? ``, 10)
+      if (!Number.isFinite(count) || count < 0) break
+      for (let atom_idx = 0; atom_idx < count && idx < lines.length; atom_idx++, idx++) {
+        while (idx < lines.length && !lines[idx]?.trim()) idx++
+        if (idx >= lines.length) break
+        const coords = vec3_from_values(lines[idx].split(/\s+/).slice(0, 3).map((v) => parse_coordinate(v) * (mode === `cart` ? cart_scale : 1)), `ABACUS atom ${atoms.length + 1}`)
+        atoms.push({ element, coords, mode })
+      }
+    }
+    return atoms.length ? build_periodic_sites(atoms, lattice_matrix, `ABACUS STRU`) : null
+  } catch (error) {
+    diag_error(`Error parsing ABACUS STRU file`, error)
+    return null
+  }
 }
 
 // @internal parser exported for tests; public entry points: parse_structure_file/parse_any_structure. Parse VASP POSCAR.
@@ -1327,13 +1547,18 @@ function parse_structure_file_impl(
     // Handle compressed files by removing compression extensions
     const base_filename = strip_compression_extensions(filename)
 
-    const ext = base_filename.split(`.`).pop()
+    const ext = base_filename.split(`.`).pop()?.toLowerCase()
 
     // Try to detect format by file extension
     if (ext === `xyz` || ext === `extxyz`) return parse_xyz(content)
 
     // CIF files
     if (ext === `cif`) return parse_cif(content)
+
+    if (ext === `cell`) return parse_castep_cell(content)
+    if (ext === `geom`) return parse_castep_geom(content)
+    if (ext === `res`) return parse_shelx(content)
+    if (/(?:^|[\\/])STRU$/i.test(base_filename)) return parse_abacus_stru(content)
 
     // JSON files - extension is authoritative, so failures return null
     if (ext === `json`) {
@@ -1405,6 +1630,14 @@ function parse_structure_file_impl(
       }
     }
   }
+
+  if (/^\s*\S+.*<-- h\s*$/im.test(content) && /^\s*\S+\s+\S+.*<-- R\s*$/im.test(content)) return parse_castep_geom(content)
+
+  if (/%?block\s+lattice_(?:cart|abc)/i.test(content) && /%?block\s+positions_(?:frac|abs|cart)/i.test(content)) return parse_castep_cell(content)
+
+  if (/^\s*CELL\b/im.test(content) && /^\s*(?:SFAC|LATT)\b/im.test(content)) return parse_shelx(content)
+
+  if (/^\s*LATTICE_(?:VECTORS|PARAMETERS)\s*$/im.test(content) && /^\s*ATOMIC_POSITIONS\s*$/im.test(content)) return parse_abacus_stru(content)
 
   // POSCAR format detection: look for typical structure
   if (lines.length >= 8) {
@@ -1697,7 +1930,7 @@ export function is_structure_file(filename: string): boolean {
 
   // Always structure formats
   if (STRUCTURE_EXTENSIONS_REGEX.test(name)) return true
-  if (VASP_FILES_REGEX.test(name)) return true
+  if (STRUCTURE_FILES_REGEX.test(name)) return true
 
   // .xyz/.extxyz files: structure unless they have trajectory keywords
   if (/\.(?:xyz|extxyz)$/i.test(name)) return !TRAJ_KEYWORDS_REGEX.test(name)
@@ -1749,6 +1982,7 @@ export const detect_structure_type = (
   }
 
   if (name_to_check.endsWith(`.cif`)) return `crystal`
+  if (/\.(?:cell|geom|res)$/i.test(name_to_check) || /(?:^|[\\/])STRU$/i.test(name_to_check)) return `crystal`
   if (name_to_check.includes(`poscar`)) return `crystal`
 
   if (name_to_check.endsWith(`.yaml`) || name_to_check.endsWith(`.yml`)) {
